@@ -7,14 +7,16 @@ A proof-of-concept that automatically compares your Edge browser policies agains
 ## How It Works
 
 ```
-Azure Logic App (runs every 4 weeks)
+Azure Logic App (runs weekly)
     │
     ├─ 1. Fetch Edge release schedule from Microsoft's public API
-    ├─ 2. Fetch Edge release notes from Microsoft Docs
-    ├─ 3. Read your Edge policy config from Azure Blob Storage
-    ├─ 4. Send all three to Azure OpenAI (GPT-4o) for conflict analysis
-    └─ 5. If conflicts found → post alert to Microsoft Teams channel
-         If no conflicts   → silent, nothing happens
+    ├─ 2. For each channel (Stable / Beta / Extended Stable):
+    │       ├─ 3. Fetch release notes for that channel from Microsoft Docs
+    │       ├─ 4. Read your Edge policy config from Azure Blob Storage
+    │       ├─ 5. Send release notes + policies to Azure OpenAI (GPT-4o) for conflict analysis
+    │       └─ 6. If conflicts found → post alert to Teams (labelled with channel name)
+    │              If no conflicts   → silent, nothing happens
+    └─ (up to 3 alerts per run, one per channel)
 ```
 
 The AI reads the actual release notes and your actual policy list and reasons about them — no hardcoded rules, no lookup tables. As Microsoft changes Edge, the analysis adapts automatically.
@@ -103,7 +105,7 @@ Add or remove rows to match your actual policies. When policies change, upload a
 4. Click **Review + create** → **Create**
 5. Once deployed, click **Go to resource**
 6. Click **Logic app designer** → **Add a trigger** → search **Recurrence**
-7. Set recurrence to **every 28 days** (Edge Stable releases every ~4 weeks)
+7. Set recurrence to **every 7 days** (weekly check covers Stable ~4 weeks, Beta ~4 weeks offset, Extended Stable ~8 weeks)
 
 **Build the flow with these actions in order:**
 
@@ -112,18 +114,25 @@ Add or remove rows to match your actual policies. When policies change, upload a
 - Method: `GET`
 - URI: `https://edgeupdates.microsoft.com/api/products`
 
-### Action 2 — Get Edge Release Notes
-- Add action: **HTTP**
-- Method: `GET`
-- URI: `https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnote-stable-channel`
-
-### Action 3 — Read Policy Config from Blob
+### Action 2 — Read Policy Config from Blob
 - Add action: **Azure Blob Storage — Get blob content**
 - Connect to your storage account using the connection string from Step 2
 - Container: `edge-policy-monitor`
 - Blob: `edge-policies.csv`
 
-### Action 4 — Analyze with Azure OpenAI
+### Actions 3–7 — Per Channel (repeat for Stable, Beta, ExtendedStable)
+
+For each channel, add the following block:
+
+**Get Release Notes**
+- Add action: **HTTP**
+- Method: `GET`
+- URI (use the appropriate channel URL):
+  - Stable: `https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnote-stable-channel`
+  - Beta: `https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnote-beta-channel`
+  - Extended Stable: `https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnote-stable-channel` (same notes, different release cadence)
+
+**Analyze with Azure OpenAI**
 - Add action: **HTTP**
 - Method: `POST`
 - URI: `https://<your-openai-endpoint>/openai/deployments/<your-deployment-name>/chat/completions?api-version=2024-02-01`
@@ -140,52 +149,17 @@ Add or remove rows to match your actual policies. When policies change, upload a
     },
     {
       "role": "user",
-      "content": "Here are the upcoming Edge release notes:\n\n@{body('Get_Edge_Release_Notes')}\n\nHere are our currently configured Edge policies:\n\n@{body('Get_blob_content')}\n\nIdentify any policies in our config that are deprecated, removed, or have changed behavior in this release. If there are no conflicts, respond with exactly: NO CONFLICTS FOUND"
+      "content": "Channel: <Stable|Beta|Extended Stable>\n\nHere are the upcoming Edge release notes:\n\n@{body('Get_Release_Notes')}\n\nHere are our currently configured Edge policies:\n\n@{body('Get_blob_content')}\n\nIdentify any policies in our config that are deprecated, removed, or have changed behavior in this release. If there are no conflicts, respond with exactly: NO CONFLICTS FOUND"
     }
   ],
   "max_tokens": 800
 }
 ```
 
-### Action 5 — Check for Conflicts
-- Add action: **Condition**
-- Check: does the AI response body **not contain** `NO CONFLICTS FOUND`
-
-**If Yes (conflicts found):**
-- Add action: **HTTP**
-- Method: `POST`
-- URI: your Teams webhook URL
-- Body:
-```json
-{
-  "type": "message",
-  "attachments": [
-    {
-      "contentType": "application/vnd.microsoft.card.adaptive",
-      "content": {
-        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-        "type": "AdaptiveCard",
-        "version": "1.4",
-        "body": [
-          {
-            "type": "TextBlock",
-            "size": "Large",
-            "weight": "Bolder",
-            "text": "⚠️ Edge Policy Conflict Detected"
-          },
-          {
-            "type": "TextBlock",
-            "text": "@{body('Analyze_with_OpenAI')?['choices'][0]['message']['content']}",
-            "wrap": true
-          }
-        ]
-      }
-    }
-  ]
-}
-```
-
-**If No (no conflicts):** leave empty — the flow ends silently.
+**Check for Conflicts and Alert**
+- Add action: **Condition** — does the AI response **not contain** `NO CONFLICTS FOUND`
+- If Yes: Add action **HTTP** → POST to Teams webhook with an Adaptive Card that includes the channel name in the title (e.g. `⚠️ Edge Policy Conflict — Beta Channel`)
+- If No: leave empty — end silently
 
 ---
 

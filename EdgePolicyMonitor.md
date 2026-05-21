@@ -1,6 +1,6 @@
 # Edge Policy Monitor — Solution Overview
 
-Automated solution that compares your Microsoft Edge group policy settings against the Edge release schedule and posts a Teams alert when upcoming releases may cause conflicts. Uses AI Builder (via Power Automate) to reason about conflicts — no hardcoded rules.
+Automated solution that compares your Microsoft Edge group policy settings against the Edge release schedule and posts a Teams alert when upcoming releases may cause conflicts. Monitors the **Stable**, **Beta**, and **Extended Stable** channels — one alert per channel. Uses AI Builder (via Power Automate) to reason about conflicts — no hardcoded rules.
 
 ---
 
@@ -11,28 +11,32 @@ The solution is split into two parts because Power Automate cannot reach on-prem
 ### Part 1 — Intune Policies (Power Automate, fully automated)
 
 ```
-Power Automate Recurrence (every 4 weeks)
-    ├─ HTTP GET Edge release API        → upcoming version + release date
-    ├─ HTTP GET Edge release notes page → changelog text
+Power Automate Recurrence (weekly check)
+    ├─ HTTP GET Edge release API        → upcoming versions for Stable, Beta, Extended Stable
+    ├─ HTTP GET Edge release notes page → changelog text (per channel)
     ├─ Graph API                        → Intune Edge policy configurations
-    ├─ AI Builder: Create text with GPT → conflict analysis (no hardcoded rules)
-    └─ Condition: conflicts found?
-            Yes → Post Adaptive Card to Teams channel
-            No  → Silent, no alert
+    ├─ For each channel (Stable / Beta / Extended Stable):
+    │       ├─ AI Builder: Create text with GPT → conflict analysis (no hardcoded rules)
+    │       └─ Condition: conflicts found?
+    │               Yes → Post Adaptive Card to Teams (labelled with channel name)
+    │               No  → Silent, no alert
+    └─ (up to 3 alerts posted per run, one per channel)
 ```
 
 ### Part 2 — On-Prem GPO Policies (PowerShell, runs on a domain-joined server)
 
 ```
-Task Scheduler (every 4 weeks, aligned to Edge release schedule)
+Task Scheduler (weekly, or aligned to shortest channel cadence ~4 weeks)
     └─► Export-EdgePolicies.ps1
             ├─ Reads all GPOs via Get-GPOReport
             ├─ Filters for Edge-related registry paths
             └─► Send-EdgePolicyAlert.ps1
-                    ├─ HTTP GET Edge release API + release notes
-                    ├─ Calls AI Builder via Power Automate HTTP trigger
-                    │   (passes GPO policy list + release notes for analysis)
-                    └─ Posts Adaptive Card to same Teams channel
+                    ├─ HTTP GET Edge release API
+                    ├─ For each channel (Stable / Beta / Extended Stable):
+                    │       ├─ Find next release within DaysAhead window
+                    │       ├─ Check exported policies against known changes table
+                    │       └─ Post separate Adaptive Card to Teams if conflicts found
+                    └─ (up to 3 alerts posted per run, one per channel)
 ```
 
 ---
@@ -104,23 +108,24 @@ The Power Automate flow reads Intune policies only. Devices managed purely by on
 
 ### Power Automate Flow (Part 1 — Intune)
 
-1. Create a new **Scheduled cloud flow** — recurrence every 28 days
+1. Create a new **Scheduled cloud flow** — recurrence **every 7 days** (weekly check covers all three channel cadences)
 2. Add **HTTP** action → GET `https://edgeupdates.microsoft.com/api/products`
-3. Add **HTTP** action → GET `https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnote-stable-channel`
-4. Add **HTTP** action → GET Intune Edge policies via Graph API (use the app registration credentials)
-5. Add **AI Builder: Create text with GPT** — pass release notes + policy list, ask for conflict analysis
-6. Add **Condition** — if AI response is not empty/no conflicts, post Adaptive Card to Teams webhook
-7. Otherwise end the flow silently
+3. For each channel (**Stable**, **Beta**, **ExtendedStable**):
+   - Add **HTTP** action → GET the corresponding release notes page from Microsoft Docs
+   - Add **HTTP** action → GET Intune Edge policies via Graph API
+   - Add **AI Builder: Create text with GPT** — pass channel name, release notes, and policy list; ask for conflict analysis
+   - Add **Condition** — if AI response does not contain `NO CONFLICTS FOUND`, post an Adaptive Card to the Teams webhook with the channel name in the title
+4. Otherwise end silently — up to 3 alerts can be posted per weekly run
 
 ### Task Scheduler (Part 2 — On-prem GPO)
 
-Create two tasks on a domain-joined server, aligned to the same 28-day schedule:
+Create two tasks on a domain-joined server. Run weekly to cover all three channel cadences:
 
 **Task 1 — Export**
 - Action: `powershell.exe -NonInteractive -File "C:\EdgeMonitor\Export-EdgePolicies.ps1"`
 
 **Task 2 — Alert (5 minutes after Task 1)**
-- Action: `powershell.exe -NonInteractive -File "C:\EdgeMonitor\Send-EdgePolicyAlert.ps1"`
+- Action: `powershell.exe -NonInteractive -File "C:\EdgeMonitor\Send-EdgePolicyAlert.ps1" -WebhookUrl "https://..." -DaysAhead 35`
 
 Both tasks must run as a service account with domain read rights.
 
@@ -140,20 +145,25 @@ Both tasks must run as a service account with domain read rights.
 .\Send-EdgePolicyAlert.ps1 `
     -ExportPath   C:\EdgeMonitor\Export `
     -WebhookUrl   "https://your-org.webhook.office.com/..." `
-    -DaysAhead    30
+    -DaysAhead    35
 ```
+
+The script checks all three channels (Stable, Beta, Extended Stable) in a single run and posts a separate Teams alert for each channel where conflicts are found.
 
 ---
 
 ## Teams Alert Example
 
-> **⚠️ Edge Policy Conflict Detected**
-> Edge **136.0.3240.50** releases in **12 days** (2026-06-02)
+> **⚠️ Edge Policy Conflict — Beta Channel**
+> Edge **149.0.4022.8** (Beta) releases in **14 days** (2026-06-04)
 >
-> **AI Analysis:**
-> The policy `LegacySameSiteCookieBehaviorEnabled` is deprecated in this release and will no longer be honored. Your current configuration relies on this policy to allow legacy cookie behavior — this may cause authentication failures on internal sites that depend on cross-site cookies.
+> **Affected policies in your config:**
+> • [GPO] **LegacySameSiteCookieBehaviorEnabled** — Deprecated — SameSite cookie enforcement is now mandatory
+> • [Intune] **DefaultPluginsSetting** — Plugin support removed; policy has no effect
 >
 > Review your GPO and Intune configurations before the release date.
+
+A separate card is posted for each channel (Stable, Beta, Extended Stable) where conflicts are detected.
 
 ---
 
